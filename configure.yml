@@ -1,0 +1,248 @@
+# mysql play
+
+- name: Configure MySQL server
+  hosts: _mysql
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - vault.yml
+
+  vars:
+    mysql_root_user: root
+    mysql_root_password: "{{mysql_root_password}}"
+    mysql_db_name: ansible_db
+    mysql_user: ansible_user
+    mysql_user_password: "{{mysql_user_password}}"
+
+  tasks:
+    - name: install pymysql
+      apt:
+        name: python3-pymysql
+        state: present
+
+    - name: install mysql
+      apt:
+        name: mysql-server
+        state: present
+        update_cache: yes
+
+    - name: running status of mysql
+      service:
+        name: mysql
+        state: started
+        enabled: yes
+
+    - name: Allow MySQL to listen on all interfaces
+      lineinfile:
+        path: /etc/mysql/mysql.conf.d/mysqld.cnf
+        regexp: "^bind-address"
+        line: "bind-address = 0.0.0.0"
+        state: present
+      notify: Restart MySQL
+
+  handlers:
+    - name: Restart MySQL
+      service:
+        name: mysql
+        state: restarted
+
+    - name: Set MySQL root password using sudo mysql
+      shell: >
+        sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ mysql_root_password }}'; FLUSH PRIVILEGES;"
+      args:
+        executable: /bin/bash
+
+    - name: create mysql database
+      community.mysql.mysql_db:
+        name: "{{ mysql_db_name }}"
+        state: present
+        login_user: "{{ mysql_root_user }}"
+        login_password: "{{ mysql_root_password }}"
+
+    - name: create mysql user
+      community.mysql.mysql_user:
+        name: "{{ mysql_user }}"
+        password: "{{ mysql_user_password }}"
+        priv: "{{ mysql_db_name }}.*:ALL"
+        state: present
+        host: "%"
+        login_user: "{{ mysql_root_user }}"
+        login_password: "{{ mysql_root_password }}"
+
+# django play
+
+- name: Configure Django backend server
+  hosts: _django
+  become: yes
+  gather_facts: yes
+  vars_files:
+    - vault.yml
+
+  vars:
+    django_app_dir: /chatapp
+    django_repo: https://github.com/ARPIT226/chat_app.git
+    db_name: ansible_db
+    db_user: ansible_user
+    db_host: "{{ hostvars[groups['_mysql'][0]].ansible_host }}"
+    db_port: 3306
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install required system packages
+      apt:
+        name:
+          - software-properties-common
+          - git
+        state: present
+
+    - name: Add deadsnakes PPA
+      apt_repository:
+        repo: ppa:deadsnakes/ppa
+        state: present
+
+    - name: Update apt cache after adding PPA
+      apt:
+        update_cache: yes
+
+    - name: Install Python 3.8 and dependencies
+      apt:
+        name:
+          - python3.8
+          - python3.8-venv
+          - python3.8-distutils
+          - gcc
+          - python3.8-dev
+          - default-libmysqlclient-dev
+          - build-essential
+          - pkg-config
+        state: present
+
+    - name: Clone Django app repo
+      git:
+        repo: "{{ django_repo }}"
+        dest: "{{ django_app_dir }}"
+        version: HEAD
+        force: yes
+
+    - name: Ensure ubuntu owns the app directory
+      file:
+        path: "{{ django_app_dir }}"
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    - name: Create Python virtual environment
+      command: python3.8 -m venv {{ django_app_dir }}/venv
+      args:
+        creates: "{{ django_app_dir }}/venv"
+
+    - name: Upgrade pip in venv
+      command: "{{ django_app_dir }}/venv/bin/pip install --upgrade pip"
+
+    - name: Install pip requirements
+      pip:
+        requirements: "{{ django_app_dir }}/requirements.txt"
+        virtualenv: "{{ django_app_dir }}/venv"
+
+    - name: Install extra Python packages
+      pip:
+        name:
+          - mysqlclient
+          - gunicorn
+        virtualenv: "{{ django_app_dir }}/venv"
+
+    - name: Set environment variables in /etc/environment
+      lineinfile:
+        path: /etc/environment
+        line: "{{ item }}"
+        create: yes
+      loop:
+        - "DB_NAME={{ db_name }}"
+        - "DB_USER={{ db_user }}"
+        - "DB_PASSWORD={{ db_password }}"
+        - "DB_HOST={{ db_host }}"
+        - "DB_PORT={{ db_port }}"
+
+    - name: Export environment variables for current session
+      shell: |
+        export DB_NAME={{ db_name }}
+        export DB_USER={{ db_user }}
+        export DB_PASSWORD={{ db_password }}
+        export DB_HOST={{ db_host }}
+        export DB_PORT={{ db_port }}
+
+    - name: Run Django makemigrations
+      command: "{{ django_app_dir }}/venv/bin/python manage.py makemigrations"
+      args:
+        chdir: "{{ django_app_dir }}/fundoo"
+
+    - name: Run Django migrate
+      command: "{{ django_app_dir }}/venv/bin/python manage.py migrate"
+      args:
+        chdir: "{{ django_app_dir }}/fundoo"
+
+    - name: create gunicorn systemd service file using jinja2
+      template:
+        src: templates/gunicorn_service.j2
+        dest: /etc/systemd/system/gunicorn.service
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable Gunicorn service
+      systemd:
+        name: gunicorn
+        enabled: yes
+
+    - name: Start Gunicorn service
+      systemd:
+        name: gunicorn
+        state: started
+
+# nginx play
+
+- name: Configure Nginx as frontend reverse proxy
+  hosts: _nginx
+  become: yes
+  gather_facts: yes
+
+  vars:
+    backend_private_ip: "{{ hostvars[groups['_django'][0]].ansible_host }}"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Create Nginx reverse proxy config using jinja2
+      template:
+        src: templates/nginx_config.j2
+        dest: /etc/nginx/sites-available/chat_app.conf
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Enable chat_app Nginx site
+      file:
+        src: /etc/nginx/sites-available/chat_app.conf
+        dest: /etc/nginx/sites-enabled/chat_app.conf
+        state: link
+        force: yes
+
+    - name: Test Nginx configuration
+      command: nginx -t
+
+    - name: Restart Nginx
+      service:
+        name: nginx
